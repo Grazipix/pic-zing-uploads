@@ -1,0 +1,108 @@
+# Temporary video hosting for the Pic-zing upload routines.
+#
+# A cloud run pushes a branch named claude/... containing:
+#   uploads/TAG      one line, the release tag, must start with "upload-"
+#   uploads/<x>.mp4  exactly one MP4
+# This workflow publishes that MP4 as a release asset. Its public URL is
+#   https://github.com/Grazipix/pic-zing-uploads/releases/download/<TAG>/<x>.mp4
+#
+# When the run is done it pushes another commit to the same branch that adds
+# uploads/DELETE (and may remove the MP4). The workflow then deletes the
+# release, its tag and the branch.
+#
+# A cleanup job every 6 hours removes any upload-* release older than 6 hours
+# and any claude/ branch whose tip has uploads/TAG and is older than 6 hours,
+# in case a run died halfway.
+
+name: Temporary video release
+
+on:
+  push:
+    branches: ['claude/**']
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: temp-video-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name == 'push' && !github.event.deleted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish or remove the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f uploads/TAG ]; then
+            echo "No uploads/TAG on this branch, nothing to do."
+            exit 0
+          fi
+          TAG=$(head -n1 uploads/TAG | tr -cd 'A-Za-z0-9._-')
+          case "$TAG" in
+            upload-?*) ;;
+            *) echo "Tag '$TAG' must start with upload-"; exit 1 ;;
+          esac
+
+          if [ -f uploads/DELETE ]; then
+            gh release delete "$TAG" --yes --cleanup-tag || echo "Release $TAG already gone."
+            git push origin --delete "$BRANCH" || echo "Branch $BRANCH already gone."
+            echo "Removed release $TAG and branch $BRANCH."
+            exit 0
+          fi
+
+          shopt -s nullglob
+          files=(uploads/*.mp4)
+          if [ ${#files[@]} -ne 1 ]; then
+            echo "Expected exactly one MP4 in uploads/, found ${#files[@]}."
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" "${files[0]}" \
+            --target "$GITHUB_SHA" --prerelease --title "$TAG" \
+            --notes "Temporary upload for posting. Deleted automatically."
+          name=$(basename "${files[0]}")
+          echo "Asset URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}"
+
+  cleanup:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove stale uploads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '6 hours ago' +%s)
+
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq '.[] | select(.tagName | startswith("upload-")) | "\(.tagName) \(.createdAt)"' |
+          while read -r tag created; do
+            if [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ]; then
+              echo "Deleting stale release $tag"
+              gh release delete "$tag" --yes --cleanup-tag || true
+            fi
+          done
+
+          gh api --paginate "repos/$GH_REPO/branches" --jq '.[].name' | grep '^claude/' |
+          while read -r br; do
+            if gh api "repos/$GH_REPO/contents/uploads/TAG?ref=$br" >/dev/null 2>&1; then
+              when=$(gh api "repos/$GH_REPO/commits/$br" --jq '.commit.committer.date')
+              if [ "$(date -u -d "$when" +%s)" -lt "$cutoff" ]; then
+                echo "Deleting stale branch $br"
+                gh api -X DELETE "repos/$GH_REPO/git/refs/heads/$br" || true
+              fi
+            fi
+          done
